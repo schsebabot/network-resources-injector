@@ -1,0 +1,243 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+early_access: false
+enable_free_tier: true
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  in_progress_fortune: false
+  review_status: true
+  collapse_walkthrough: false
+
+  path_filters:
+    - "!**/vendor/**"
+    - "!vendor/**"
+    - "!**/zz_generated*"
+    - "!glide.lock"
+
+  auto_review:
+    enabled: true
+    drafts: true
+
+  # ── Path instructions ────────────────────────────────────────
+  path_instructions:
+
+    # ── Go code — general ────────────────────────────────────────
+    - path: "**/*.go"
+      instructions: |
+        Go security and best practices:
+        - Never ignore error returns; wrap errors with context using fmt.Errorf("...: %w", err)
+        - Use stdlib crypto/* and golang.org/x/crypto; avoid third-party crypto libraries
+        - Integer overflow: bounds-check user-supplied sizes
+        - context.Context for cancellation and timeouts on all network/API operations
+        - Nil pointer checks on Kubernetes API objects (AdmissionReview, Pod, Container)
+          before accessing fields — admission requests can contain incomplete data
+        - Use structured logging (klog or glog) with appropriate verbosity levels
+        - This is a mutating admission webhook project — all Pod mutation logic must be
+          idempotent: applying the same mutation twice should produce the same result
+
+    # ── Mutating webhook handler ─────────────────────────────────
+    - path: "pkg/webhook/**/*.go"
+      instructions: |
+        Mutating admission webhook review:
+        - JSON patch operations must be correct: verify patch paths use proper
+          JSON Pointer escaping (RFC 6901), especially for annotation keys
+          containing '/' or '~' characters
+        - NetworkAttachmentDefinition lookups: verify the webhook correctly
+          parses the 'k8s.v1.cni.cncf.io/networks' annotation (both simple
+          string format and JSON array format) and handles missing/malformed values
+        - Resource injection: when injecting resource requests/limits from
+          'k8s.v1.cni.cncf.io/resourceName' annotations on NetworkAttachmentDefinitions,
+          verify that existing container resource requests are preserved (additive, not
+          overwriting)
+        - Idempotency: re-admission of the same Pod must not double-count resources
+          or produce duplicate JSON patch operations
+        - Admission response: always return a valid AdmissionResponse, even on error;
+          never leave the response unset as this blocks Pod creation
+        - TLS configuration: verify minimum TLS version (1.2+), secure cipher suites,
+          and proper certificate loading/rotation
+        - Webhook must handle edge cases: Pods with no containers, Pods with
+          init containers, Pods with multiple network annotations, and
+          NetworkAttachmentDefinitions without resourceName annotations
+
+    # ── Installer / certificate management ───────────────────────
+    - path: "pkg/installer/**/*.go"
+      instructions: |
+        Installer and certificate management review:
+        - CSR generation (via cloudflare/cfssl): verify key size (minimum RSA 2048
+          or EC P-256), proper Subject/SAN fields matching the webhook service DNS name
+        - MutatingWebhookConfiguration creation: verify caBundle is set correctly,
+          failurePolicy is appropriate (Fail vs Ignore), and namespaceSelector/
+          objectSelector are properly scoped to avoid intercepting system namespaces
+        - Certificate rotation: verify the installer handles cert expiry and renewal
+        - Service/Secret management: verify proper RBAC is used for creating/updating
+          Secrets containing TLS certificates
+        - Error handling: certificate operations can fail due to API server unavailability
+          or RBAC issues — handle these gracefully with retry logic
+
+    # ── Binary entry points ──────────────────────────────────────
+    - path: "cmd/**/*.go"
+      instructions: |
+        Entry point review (webhook server and installer binaries):
+        - TLS configuration: verify secure defaults for the HTTPS server
+          (minimum TLS 1.2, no weak cipher suites)
+        - Signal handling: verify graceful shutdown on SIGTERM/SIGINT,
+          including draining in-flight admission requests
+        - Flag parsing: validate all command-line flags have sensible defaults
+          and proper usage descriptions
+        - Health/readiness endpoints: verify the webhook server exposes
+          health check endpoints for Kubernetes probes
+        - Error handling at startup: fail fast with clear error messages
+          if TLS certificates are missing or invalid
+
+    # ── Deployment manifests ─────────────────────────────────────
+    - path: "deployments/**/*.yaml"
+      instructions: |
+        Webhook deployment manifests review:
+        - MutatingWebhookConfiguration: verify failurePolicy (Fail vs Ignore),
+          reinvocationPolicy, timeoutSeconds, and namespaceSelector are appropriate
+        - RBAC (auth.yaml): verify least-privilege — the webhook only needs
+          read access to NetworkAttachmentDefinitions and Pods; the installer needs
+          create/update access to MutatingWebhookConfiguration and Secrets
+        - Service: verify the webhook Service targets the correct port and selector
+        - Pod security: runAsNonRoot, readOnlyRootFilesystem, drop ALL capabilities,
+          resource requests/limits defined
+        - automountServiceAccountToken: only true if the webhook needs to call
+          the Kubernetes API (e.g., to look up NetworkAttachmentDefinitions)
+
+    # ── Kubernetes/OpenShift manifests (generic) ─────────────────
+    - path: "**/*.{yaml,yml}"
+      instructions: |
+        If this is a Kubernetes/OpenShift manifest:
+        - securityContext: runAsNonRoot, readOnlyRootFilesystem,
+          allowPrivilegeEscalation: false where applicable
+        - Drop ALL capabilities, add only what is required
+        - Resource limits (cpu, memory) on every container
+        - RBAC: least privilege; no cluster-admin for workloads
+        - Liveness + readiness probes defined
+        - automountServiceAccountToken: false unless needed
+
+        Webhook-specific checks:
+        - MutatingWebhookConfiguration: verify caBundle injection and failurePolicy
+        - Webhook Service: verify port mapping matches the webhook server's listen port
+        - NetworkAttachmentDefinition CRDs: verify the annotation format matches
+          what the webhook expects ('k8s.v1.cni.cncf.io/resourceName')
+
+    # ── Dockerfiles / container images ───────────────────────────
+    - path: "**/{Dockerfile,Containerfile}*"
+      instructions: |
+        Container image security:
+        - Multi-stage builds preferred; no build tools in final image
+        - USER non-root where possible
+        - COPY specific files, not entire context
+        - No secrets in ENV, ARG, or COPY
+        - No package manager cache in final layer
+        - This project has 2 container images:
+          Dockerfile (Alpine-based webhook), Dockerfile.rhel7 (OpenShift-based webhook)
+        - Both images should produce the same binary behavior — verify
+          consistency between build approaches
+
+    # ── Unit tests ───────────────────────────────────────────────
+    - path: "{pkg,cmd}/**/*_test.go"
+      instructions: |
+        Unit test quality (Ginkgo v1 + Gomega):
+        - Test names must be stable and deterministic — no dynamic values
+          (pod names, timestamps, UUIDs) in It/Describe/Context titles
+        - Mock Kubernetes API calls (fake clientset) rather than requiring
+          a real cluster
+        - Test webhook mutation edge cases: Pods with no networks annotation,
+          malformed annotations, missing NetworkAttachmentDefinitions,
+          containers with pre-existing resource requests
+        - Test JSON patch output correctness — verify patches can be applied
+          to produce the expected mutated Pod
+        - Test error paths, not just happy paths
+        - Assertions should include descriptive failure messages
+        - Single responsibility: each It block should test one behavior
+
+    # ── Supply chain & dependencies ──────────────────────────────
+    - path: "glide.yaml"
+      instructions: |
+        Supply chain security (glide dependency management):
+        - New dependencies: justify the need, check license compatibility
+        - Pin exact versions; verify no unnecessary transitive dependencies added
+        - Flag known CVEs (cross-ref osv.dev)
+        - Key dependencies to monitor:
+          * k8s.io/api, k8s.io/apimachinery, k8s.io/client-go — Kubernetes API
+          * github.com/cloudflare/cfssl — TLS certificate generation
+          * github.com/k8snetworkplumbingwg/network-attachment-definition-client — NAD CRD client
+        - Verify version compatibility between Kubernetes client libraries
+
+    # ── CI/CD & GitHub Actions ───────────────────────────────────
+    - path: ".github/workflows/**/*"
+      instructions: |
+        CI/CD security:
+        - Pin actions by full SHA, not tag
+        - No secrets in logs; mask sensitive outputs
+        - Least privilege: minimize GITHUB_TOKEN permissions
+        - No pull_request_target with checkout of PR head
+        - Verify workflows run the full validation suite
+        - Image build workflows: verify image tags and push targets are correct
+
+    # ── Cryptography files ───────────────────────────────────────
+    - path: "**/*{crypt,cipher,sign,hash,tls,ssl,cert,key,token}*"
+      instructions: |
+        Cryptographic security:
+        - Banned: MD5, SHA1, DES, RC4, 3DES, Blowfish, ECB mode
+        - Symmetric: AES-256-GCM or ChaCha20-Poly1305
+        - Signing: Ed25519 or ECDSA P-256+
+        - Constant-time comparison for all secret/token data
+        - No custom crypto; use vetted libraries only
+        - Webhook TLS certificates: verify proper rotation and
+          minimum TLS version (1.2+)
+        - Certificate generation (cfssl): verify key sizes meet
+          current security requirements (RSA 2048+ or EC P-256+)
+
+    # ── Build and deployment scripts ─────────────────────────────
+    - path: "scripts/**"
+      instructions: |
+        Build and deployment script review:
+        - Shell scripts must use 'set -euo pipefail' for safety
+        - No hardcoded credentials or secrets in scripts
+        - Verify image build scripts use proper tagging and registry references
+        - webhook-patch-ca-bundle.sh: verify CA bundle extraction is correct
+          and handles missing/expired certificates
+        - webhook-deployment.sh: verify webhook registration uses correct
+          service reference and namespace
+        - Build scripts should produce reproducible builds where possible
+
+  # ── Security scanners ────────────────────────────────────────
+  tools:
+    gitleaks:
+      enabled: true
+    semgrep:
+      enabled: true
+    checkov:
+      enabled: true
+    hadolint:
+      enabled: true
+    trivy:
+      enabled: true
+    osvScanner:
+      enabled: true
+    actionlint:
+      enabled: true
+    ast-grep:
+      essential_rules: true
+
+# ── Knowledge base ───────────────────────────────────────────
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/CONTRIBUTING.md"
+  issues:
+    scope: "auto"
+  pull_requests:
+    scope: "auto"
+
+chat:
+  auto_reply: true
+  art: false
