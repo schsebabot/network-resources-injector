@@ -1,0 +1,192 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+early_access: false
+enable_free_tier: true
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  in_progress_fortune: false
+  review_status: true
+  collapse_walkthrough: false
+
+  path_filters:
+    - "!**/vendor/**"
+    - "!vendor/**"
+    - "!glide.lock"
+
+  auto_review:
+    enabled: true
+    drafts: true
+
+  # ── Path instructions ────────────────────────────────────────
+  path_instructions:
+
+    # ── Go code — general ────────────────────────────────────────
+    - path: "**/*.go"
+      instructions: |
+        Go security and best practices:
+        - Never ignore error returns; wrap errors with context using fmt.Errorf("...: %w", err)
+        - Use stdlib crypto/* and golang.org/x/crypto; avoid third-party crypto libraries
+        - Integer overflow: bounds-check user-supplied sizes
+        - context.Context for cancellation and timeouts on all network/API operations
+        - Use structured logging (glog) with appropriate verbosity levels
+        - Admission webhook error handling: always return a proper AdmissionResponse
+          with clear error messages — never panic or crash on malformed input
+        - JSON patch operations: validate patch paths and values; ensure patches
+          are well-formed RFC 6902 operations
+        - Nil pointer checks on Kubernetes API objects before accessing nested fields —
+          Pod specs, container lists, and annotations can be nil or empty
+
+    # ── Mutating webhook handler ─────────────────────────────────
+    - path: "pkg/webhook/**/*.go"
+      instructions: |
+        Mutating admission webhook review:
+        - Mutation must be idempotent — applying the webhook twice to the same
+          Pod should produce the same result (no duplicate resource injections)
+        - Annotation parsing: validate the k8s.v1.cni.cncf.io/networks annotation
+          format before processing; handle both simple ("net1") and JSON array formats
+        - NetworkAttachmentDefinition lookups: handle missing or malformed NADs
+          gracefully with clear error messages in the AdmissionResponse
+        - Resource injection: verify that resource requests and limits are set
+          consistently — do not set limits without requests or vice versa
+        - JSON patch generation: ensure patch operations target correct container
+          indices and resource paths; test with multi-container pods
+        - TLS configuration: verify minimum TLS version (1.2+), proper certificate
+          loading, and graceful handling of cert rotation
+        - Do not modify pods in kube-system or other critical namespaces unless
+          explicitly configured to do so
+        - Verify that the webhook handles edge cases: pods with no containers,
+          pods with init containers, pods with existing resource requests
+
+    # ── Installer (cert + webhook config) ────────────────────────
+    - path: "pkg/installer/**/*.go"
+      instructions: |
+        Installer review (certificate CSR and webhook configuration):
+        - Certificate CSR generation: verify proper key sizes (RSA 2048+ or
+          ECDSA P-256+), correct SANs (service DNS names), and appropriate
+          validity periods
+        - MutatingWebhookConfiguration lifecycle: ensure the installer creates,
+          updates, and cleans up webhook configurations correctly
+        - Kubernetes API interactions: use proper RBAC-scoped clients; handle
+          API errors (conflict, not found, forbidden) gracefully with retries
+          where appropriate
+        - caBundle injection: verify the CA certificate is correctly encoded
+          (base64 PEM) and matches the serving certificate chain
+        - failurePolicy: should be Fail for security-critical webhooks or
+          Ignore with documented justification — verify the chosen policy
+        - Cleanup: ensure the installer removes certificates and webhook
+          configurations on uninstall to avoid orphaned resources
+
+    # ── Build scripts ────────────────────────────────────────────
+    - path: "scripts/**/*.sh"
+      instructions: |
+        Shell script review:
+        - Use set -euo pipefail at the top of every script
+        - Quote all variable expansions to prevent word splitting
+        - No hardcoded secrets, tokens, or credentials
+        - Use shellcheck-clean patterns; avoid common pitfalls
+          (unquoted globs, eval, backticks instead of $())
+        - Verify webhook-patch-ca-bundle.sh correctly handles
+          base64 encoding across platforms (Linux vs macOS)
+
+    # ── Kubernetes manifests ─────────────────────────────────────
+    - path: "**/*.{yaml,yml}"
+      instructions: |
+        If this is a Kubernetes manifest:
+        - securityContext: runAsNonRoot, readOnlyRootFilesystem,
+          allowPrivilegeEscalation: false where applicable
+        - Drop ALL capabilities, add only what is required
+        - Resource limits (cpu, memory) on every container
+        - RBAC: least privilege; no cluster-admin for workloads
+        - Liveness + readiness probes defined
+        - automountServiceAccountToken: false unless needed
+
+        Admission webhook specifics:
+        - MutatingWebhookConfiguration: verify caBundle is injected correctly,
+          failurePolicy is appropriate (Fail vs Ignore), and namespaceSelector
+          excludes kube-system and other critical namespaces
+        - Service manifest: verify the webhook service correctly targets
+          the webhook server pods on the correct port (typically 443)
+        - RBAC: the webhook needs read access to NetworkAttachmentDefinitions
+          and pods — verify no excess permissions are granted
+        - Deployment/DaemonSet: verify the webhook server has proper TLS
+          volume mounts for serving certificates
+
+    # ── Dockerfiles / container images ───────────────────────────
+    - path: "**/{Dockerfile,Containerfile}*"
+      instructions: |
+        Container image security:
+        - Multi-stage builds preferred; no build tools in final image
+        - USER non-root where possible
+        - COPY specific files, not entire context
+        - No secrets in ENV, ARG, or COPY
+        - No package manager cache in final layer
+        - This project has 2 container images:
+          Dockerfile (Alpine-based webhook server),
+          Dockerfile.rhel7 (OpenShift/RHEL-based build)
+        - The webhook image should be minimal — verify no unnecessary
+          packages or tools are included in the final image
+
+    # ── Unit tests ───────────────────────────────────────────────
+    - path: "{pkg,cmd}/**/*_test.go"
+      instructions: |
+        Unit test quality (Ginkgo v1 + Gomega):
+        - Use table-driven tests for validation logic with multiple cases
+        - Mock Kubernetes API calls (admission requests, NAD lookups)
+          rather than requiring a real cluster
+        - Test error paths, not just happy paths — especially malformed
+          admission requests, missing NADs, and invalid annotations
+        - Test webhook idempotency: applying mutation twice should not
+          change the result
+        - Test multi-container pods, init containers, and edge cases
+          (empty pod spec, no annotations, conflicting resources)
+        - Assertions should include descriptive failure messages
+
+    # ── Cryptography files ───────────────────────────────────────
+    - path: "**/*{crypt,cipher,sign,hash,tls,ssl,cert,key,token}*"
+      instructions: |
+        Cryptographic security:
+        - Banned: MD5, SHA1, DES, RC4, 3DES, Blowfish, ECB mode
+        - Symmetric: AES-256-GCM or ChaCha20-Poly1305
+        - Signing: Ed25519 or ECDSA P-256+
+        - Constant-time comparison for all secret/token data
+        - No custom crypto; use vetted libraries only
+        - Webhook TLS certificates: verify proper rotation and
+          minimum TLS version (1.2+)
+        - CSR generation (cfssl): verify key sizes and signature
+          algorithms meet current security standards
+
+  # ── Security scanners ────────────────────────────────────────
+  tools:
+    gitleaks:
+      enabled: true
+    semgrep:
+      enabled: true
+    checkov:
+      enabled: true
+    hadolint:
+      enabled: true
+    trivy:
+      enabled: true
+    osvScanner:
+      enabled: true
+    ast-grep:
+      essential_rules: true
+
+# ── Knowledge base ───────────────────────────────────────────
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/CONTRIBUTING.md"
+  issues:
+    scope: "auto"
+  pull_requests:
+    scope: "auto"
+
+chat:
+  auto_reply: true
+  art: false
